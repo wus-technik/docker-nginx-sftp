@@ -1,0 +1,8 @@
+# Everything that runs inside the Linux image must keep LF endings, regardless
+# of the checkout platform - a CRLF shebang line is not a valid interpreter.
+*.sh text eol=lf
+*.py text eol=lf
+*.conf text eol=lf
+*.ini text eol=lf
+Dockerfile text eol=lf
+sshd_config text eol=lf

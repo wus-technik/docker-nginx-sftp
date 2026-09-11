@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+    - name: check out code
+      uses: actions/checkout@v7
+
+    - name: install shellcheck
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y shellcheck
+
+    - name: check shell syntax
+      run: |
+        sh -n entrypoint.sh
+        sh -n ci/smoke-test.sh
+
+    - name: lint shell scripts
+      run: shellcheck entrypoint.sh ci/smoke-test.sh
+
+    - name: check python syntax
+      run: python3 -m py_compile docker_kill.py
+
+    - name: set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: build docker image
+      run: docker build --pull --tag nginx-sftp:test .
+
+    - name: smoke test built image
+      timeout-minutes: 15
+      run: ./ci/smoke-test.sh nginx-sftp:test
