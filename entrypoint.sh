@@ -78,7 +78,10 @@ EXIT_FIFO=/run/service-exited
 rm -f "${EXIT_FIFO}"
 mkfifo "${EXIT_FIFO}"
 
-# shellcheck disable=SC2329  # invoked through the trap below
+# Invoked through the trap below. Both codes are needed: shellcheck calls this
+# "unused function" (SC2329) since 0.10 and "unreachable" (SC2317) before that,
+# and CI runs whatever the runner image ships.
+# shellcheck disable=SC2329,SC2317
 shut_down() {
     echo "Received signal, shutting down"
     exit 0
