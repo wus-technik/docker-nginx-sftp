@@ -3,9 +3,21 @@ ARG ALPINE_VERSION=3.24
 FROM alpine:${ALPINE_VERSION}
 
 LABEL org.opencontainers.image.title="docker-nginx-sftp" \
-      org.opencontainers.image.description="nginx serving static files that are managed over SFTP" \
+      org.opencontainers.image.description="wus-technik maintained nginx image serving static files that are managed over SFTP, based on upstream theomega/docker-nginx-sftp" \
+      org.opencontainers.image.vendor="wus-technik" \
+      org.opencontainers.image.authors="wus-technik" \
       org.opencontainers.image.source="https://github.com/wus-technik/docker-nginx-sftp" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.url="https://github.com/wus-technik/docker-nginx-sftp" \
+      org.opencontainers.image.documentation="https://github.com/wus-technik/docker-nginx-sftp#readme" \
+      org.opencontainers.image.licenses="NOASSERTION"
+
+# Fork origin. Upstream has not moved since 2017-08-20; d8965511 is the last
+# commit that came from there. The NOASSERTION above is not an oversight:
+# upstream never published a license, so there is nothing to inherit and
+# nothing we could grant on top of it.
+LABEL com.wus-technik.upstream.source="https://github.com/theomega/docker-nginx-sftp" \
+      com.wus-technik.upstream.author="Dominik Bruhn" \
+      com.wus-technik.upstream.commit="d89655117bb9cb1a6c21bbd88b02b6f7ff34c5e3"
 
 # No supervisor: it is a Python program and pulled python3 + py3-setuptools
 # into the image (~57 MB) to keep two processes alive. entrypoint.sh does that

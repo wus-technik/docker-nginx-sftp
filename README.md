@@ -2,6 +2,10 @@ docker-nginx-sftp
 =================
 [![ci](https://github.com/wus-technik/docker-nginx-sftp/actions/workflows/ci.yml/badge.svg)](https://github.com/wus-technik/docker-nginx-sftp/actions/workflows/ci.yml) [![build](https://github.com/wus-technik/docker-nginx-sftp/actions/workflows/build.yml/badge.svg)](https://github.com/wus-technik/docker-nginx-sftp/actions/workflows/build.yml)
 
+Maintained by W&S Technik GmbH. Fork of
+[theomega/docker-nginx-sftp](https://github.com/theomega/docker-nginx-sftp) by
+Dominik Bruhn - see [Credits](#credits).
+
 Purpose
 -------
 The image provides an http server which serves static files. The static files
@@ -103,6 +107,21 @@ host keys survive a restart:
 
 The same test runs in CI (`.github/workflows/ci.yml`) on every push and before
 every push to the registry (`.github/workflows/build.yml`).
+
+Credits
+-------
+This image started as a fork of
+[theomega/docker-nginx-sftp](https://github.com/theomega/docker-nginx-sftp) by
+Dominik Bruhn. Commit `d8965511` (2017-08-20) is the last one that came from
+there; the original idea, layout and most of the configuration files are his.
+
+Everything since is maintained by W&S Technik GmbH: current alpine base, CI and
+the published images on GHCR, the smoke test, and the replacement of supervisord
+with tini.
+
+Upstream never published a license, so there is nothing we can relicense or
+sublicense - the image labels carry `NOASSERTION` rather than a license we made
+up. If you intend to use this image outside W&S Technik, clarify that first.
 
 Anti-Pattern
 ------------
