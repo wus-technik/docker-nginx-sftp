@@ -111,6 +111,38 @@ http_get() {
     docker exec "${CONTAINER}" wget -q -O - "http://127.0.0.1$1" 2>&1
 }
 
+# Kill a service ($2 is the kill command, SIGKILL i.e. a crash rather than an
+# orderly shutdown) and require the container to stop with a non-zero code -
+# a restart policy only reacts to failure exits.
+check_watchdog() {
+    service=$1
+    kill_cmd=$2
+
+    docker exec "${CONTAINER}" sh -c "${kill_cmd}" >/dev/null 2>&1 || true
+
+    waited=0
+    while [ "${waited}" -lt 30 ]; do
+        if [ -z "$(running)" ]; then
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    if [ -n "$(running)" ]; then
+        fail "container kept running ${waited}s after ${service} died"
+        docker logs "${CONTAINER}" 2>&1 | tail -20
+        return 1
+    fi
+
+    rc=$(docker inspect -f '{{.State.ExitCode}}' "${CONTAINER}")
+    if [ "${rc}" = "0" ]; then
+        fail "container stopped after ${service} died, but exited 0"
+    else
+        pass "container stopped after ${service} died (${waited}s, exit ${rc})"
+    fi
+}
+
 NETWORK="nginx-sftp-smoke-net-$$"
 docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 docker network create "${NETWORK}" >/dev/null
@@ -194,30 +226,48 @@ put /etc/hostname uploaded.html') || true
     # -----------------------------------------------------------------------
 
     echo "== watchdog: nginx crash stops the container =="
-    # SIGKILL on the pid supervisord tracks: a "supervisorctl stop" would be an
-    # orderly stop and must not take the container down.
-    docker exec "${CONTAINER}" sh -c 'kill -9 "$(supervisorctl pid nginx)"' >/dev/null 2>&1 || true
+    # shellcheck disable=SC2016  # expands inside the container, not here
+    check_watchdog "nginx" 'kill -9 "$(cat /run/nginx/nginx.pid)"'
+fi
+drop_container
 
-    waited=0
-    while [ "${waited}" -lt 30 ]; do
-        if [ -z "$(running)" ]; then
-            break
-        fi
-        sleep 2
-        waited=$((waited + 2))
-    done
+# A crashed sshd has to take the container down just like a crashed nginx -
+# otherwise the container stays "up" while nobody can upload any more.
+echo "== watchdog: sshd crash stops the container =="
+if start_container ""; then
+    # shellcheck disable=SC2016  # expands inside the container, not here
+    check_watchdog "sshd" 'kill -9 "$(pidof sshd)"'
+fi
+drop_container
 
-    if [ -n "$(running)" ]; then
-        fail "container kept running ${waited}s after nginx died"
-        docker logs "${CONTAINER}" 2>&1 | tail -20
+# ---------------------------------------------------------------------------
+# 5. docker stop terminates promptly
+#
+#    PID 1 has to act on SIGTERM itself. A process that ignores it makes every
+#    "docker stop" sit out the full grace period before the SIGKILL - visible
+#    only as a slow deployment, never as an error.
+# ---------------------------------------------------------------------------
+
+echo "== signals: docker stop terminates promptly =="
+if start_container ""; then
+    started=$(date +%s)
+    docker stop -t 30 "${CONTAINER}" >/dev/null
+    elapsed=$(( $(date +%s) - started ))
+    rc=$(docker inspect -f '{{.State.ExitCode}}' "${CONTAINER}")
+    drop_container
+
+    if [ "${elapsed}" -gt 10 ]; then
+        fail "docker stop took ${elapsed}s, SIGTERM was not handled"
+    elif [ "${rc}" != "0" ]; then
+        fail "orderly stop exited with ${rc}, expected 0"
     else
-        pass "container stopped after nginx died (${waited}s)"
+        pass "docker stop completed in ${elapsed}s (exit ${rc})"
     fi
 fi
 drop_container
 
 # ---------------------------------------------------------------------------
-# 5. Host keys are generated once and reused from the volume
+# 6. Host keys are generated once and reused from the volume
 # ---------------------------------------------------------------------------
 
 echo "== host keys: generated once, reused from the volume =="

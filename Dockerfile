@@ -7,8 +7,11 @@ LABEL org.opencontainers.image.title="docker-nginx-sftp" \
       org.opencontainers.image.source="https://github.com/wus-technik/docker-nginx-sftp" \
       org.opencontainers.image.licenses="MIT"
 
-# python3 is required by docker_kill.py, the supervisord event listener
-RUN apk add --no-cache nginx supervisor openssh-server openssh-sftp-server python3
+# No supervisor: it is a Python program and pulled python3 + py3-setuptools
+# into the image (~57 MB) to keep two processes alive. entrypoint.sh does that
+# itself, with tini (23 KiB) as PID 1 - see the comment there on why the shell
+# must not be PID 1.
+RUN apk add --no-cache nginx openssh-server openssh-sftp-server tini
 
 # NGINX
 RUN mkdir -p /run/nginx/ && \
@@ -21,9 +24,8 @@ COPY nginx.conf /etc/nginx/http.d/default.conf
 # SSH/SFTP
 COPY sshd_config /etc/ssh/sshd_config
 
-# Supervisord
-COPY supervisord.ini /etc/supervisor.d/
-COPY docker_kill.py entrypoint.sh /
+# Init / process supervision
+COPY entrypoint.sh /
 
 # Configuration for Container
 VOLUME /data /etc/ssh/keys/
@@ -32,5 +34,6 @@ EXPOSE 22 80
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget -q -O /dev/null http://127.0.0.1/internal/health || exit 1
 
-# Creates users, checks permissions, generates host-keys and launches supervisord
+# Creates users, checks permissions, generates host-keys and runs the services
+ENTRYPOINT ["/sbin/tini", "-g", "--"]
 CMD ["/entrypoint.sh"]

@@ -74,18 +74,22 @@ on alpine linux (see `ARG ALPINE_VERSION` in the `Dockerfile`) and contains the
 following additional packages:
   * `openssh-server` and `openssh-sftp-server` to provide the sftp server
   * `nginx` to provide the http server
-  * `supervisord` to orchestrate the two processes (nginx + openssh) and keep
-    them running
-  * `python3`, required by the supervisord event listener
+  * `tini` as PID 1, which forwards signals to both services and reaps orphans
 
-The packages are configured using the configuration files in this repo.
-Supervisord is configured to fail the whole container is either of the two
-processes fail. All the logging goes to the docker output, so you will see both,
-the nginx access log and the sftp connection output.
+The packages are configured using the configuration files in this repo. All the
+logging goes to the docker output, so you will see both, the nginx access log
+and the sftp connection output.
 
-A small python script called `docker_kill.py` is used as an eventlistener for
-supervisord. The listener automatically kills the whole supervisord (and with
-this the whole container) if one of the subprocesses (nginx and sshd) fail.
+`entrypoint.sh` starts both services and exits non-zero as soon as one of them
+exits - a half-dead container that still answers on one port is worse than a
+restart by the orchestrator. It does that by running each service in a subshell
+that reports the exit through a fifo, because busybox ash never returns from
+`wait` for a killed background child.
+
+This used to be `supervisord` plus a python eventlistener (`docker_kill.py`).
+supervisor is a python program, so it pulled `python3` and `py3-setuptools`
+into the image: 100 MB then against 20 MB now, for orchestrating two
+processes.
 
 Development
 -----------

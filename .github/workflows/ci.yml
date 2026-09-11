@@ -25,9 +25,6 @@ jobs:
     - name: lint shell scripts
       run: shellcheck entrypoint.sh ci/smoke-test.sh
 
-    - name: check python syntax
-      run: python3 -m py_compile docker_kill.py
-
     - name: set up Docker Buildx
       uses: docker/setup-buildx-action@v4
 
