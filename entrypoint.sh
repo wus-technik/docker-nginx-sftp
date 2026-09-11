@@ -50,4 +50,54 @@ if [ ! -f /etc/ssh/keys/ssh_host_rsa_key ]; then
     ssh-keygen -t rsa -b 4096 -f /etc/ssh/keys/ssh_host_rsa_key -N ''
 fi
 
-exec /usr/bin/supervisord -n -c /etc/supervisord.conf
+# ---------------------------------------------------------------------------
+# Process supervision
+#
+# This replaces supervisord: supervisor is a Python program and dragged
+# python3 + py3-setuptools into the image, ~57 MB of the ~70 MB it used to
+# weigh, to keep two processes alive and kill the container when one of them
+# dies. A shell can do that in a dozen lines.
+#
+# Each service runs in the foreground of its own subshell, which reports the
+# exit to a fifo; this script blocks on that fifo. The obvious "wait -n" loop
+# does not work here: busybox ash never returns from wait when a background
+# child is killed, so a crashed nginx would go unnoticed and the container
+# would keep answering on port 22 alone. Waiting on a foreground child is the
+# reliable path, and reading a fifo is a wait that cannot be missed.
+#
+# tini is PID 1 (ENTRYPOINT in the Dockerfile): it forwards signals to the
+# whole process group, so "docker stop" reaches both services, and it reaps
+# orphans. When this script exits, tini exits, and the container is gone -
+# that is what takes the surviving service down.
+#
+# Both services log to this script's stdout/stderr, which is the container log.
+# /var/log/nginx/{access,error}.log are symlinked to stdout/stderr in the image.
+# ---------------------------------------------------------------------------
+
+EXIT_FIFO=/run/service-exited
+rm -f "${EXIT_FIFO}"
+mkfifo "${EXIT_FIFO}"
+
+# Invoked through the trap below. Both codes are needed: shellcheck calls this
+# "unused function" (SC2329) since 0.10 and "unreachable" (SC2317) before that,
+# and CI runs whatever the runner image ships.
+# shellcheck disable=SC2329,SC2317
+shut_down() {
+    echo "Received signal, shutting down"
+    exit 0
+}
+trap shut_down TERM INT
+
+echo "Starting nginx"
+( nginx -g "daemon off;"; echo "nginx exited with status $?" > "${EXIT_FIFO}" ) &
+
+echo "Starting sshd"
+( /usr/sbin/sshd -D -e; echo "sshd exited with status $?" > "${EXIT_FIFO}" ) &
+
+# If either service exits, the whole container goes down - a half-dead
+# container that still answers on one port is worse than a restart by the
+# orchestrator.
+read -r reason < "${EXIT_FIFO}"
+echo >&2 "${reason}, stopping container"
+
+exit 1

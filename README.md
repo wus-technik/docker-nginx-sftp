@@ -2,6 +2,10 @@ docker-nginx-sftp
 =================
 [![ci](https://github.com/wus-technik/docker-nginx-sftp/actions/workflows/ci.yml/badge.svg)](https://github.com/wus-technik/docker-nginx-sftp/actions/workflows/ci.yml) [![build](https://github.com/wus-technik/docker-nginx-sftp/actions/workflows/build.yml/badge.svg)](https://github.com/wus-technik/docker-nginx-sftp/actions/workflows/build.yml)
 
+Maintained by W&S Technik GmbH. Fork of
+[theomega/docker-nginx-sftp](https://github.com/theomega/docker-nginx-sftp) by
+Dominik Bruhn - see [Credits](#credits).
+
 Purpose
 -------
 The image provides an http server which serves static files. The static files
@@ -74,18 +78,22 @@ on alpine linux (see `ARG ALPINE_VERSION` in the `Dockerfile`) and contains the
 following additional packages:
   * `openssh-server` and `openssh-sftp-server` to provide the sftp server
   * `nginx` to provide the http server
-  * `supervisord` to orchestrate the two processes (nginx + openssh) and keep
-    them running
-  * `python3`, required by the supervisord event listener
+  * `tini` as PID 1, which forwards signals to both services and reaps orphans
 
-The packages are configured using the configuration files in this repo.
-Supervisord is configured to fail the whole container is either of the two
-processes fail. All the logging goes to the docker output, so you will see both,
-the nginx access log and the sftp connection output.
+The packages are configured using the configuration files in this repo. All the
+logging goes to the docker output, so you will see both, the nginx access log
+and the sftp connection output.
 
-A small python script called `docker_kill.py` is used as an eventlistener for
-supervisord. The listener automatically kills the whole supervisord (and with
-this the whole container) if one of the subprocesses (nginx and sshd) fail.
+`entrypoint.sh` starts both services and exits non-zero as soon as one of them
+exits - a half-dead container that still answers on one port is worse than a
+restart by the orchestrator. It does that by running each service in a subshell
+that reports the exit through a fifo, because busybox ash never returns from
+`wait` for a killed background child.
+
+This used to be `supervisord` plus a python eventlistener (`docker_kill.py`).
+supervisor is a python program, so it pulled `python3` and `py3-setuptools`
+into the image: 100 MB then against 20 MB now, for orchestrating two
+processes.
 
 Development
 -----------
@@ -99,6 +107,21 @@ host keys survive a restart:
 
 The same test runs in CI (`.github/workflows/ci.yml`) on every push and before
 every push to the registry (`.github/workflows/build.yml`).
+
+Credits
+-------
+This image started as a fork of
+[theomega/docker-nginx-sftp](https://github.com/theomega/docker-nginx-sftp) by
+Dominik Bruhn. Commit `d8965511` (2017-08-20) is the last one that came from
+there; the original idea, layout and most of the configuration files are his.
+
+Everything since is maintained by W&S Technik GmbH: current alpine base, CI and
+the published images on GHCR, the smoke test, and the replacement of supervisord
+with tini.
+
+Upstream never published a license, so there is nothing we can relicense or
+sublicense - the image labels carry `NOASSERTION` rather than a license we made
+up. If you intend to use this image outside W&S Technik, clarify that first.
 
 Anti-Pattern
 ------------
