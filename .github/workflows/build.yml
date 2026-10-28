@@ -2,23 +2,29 @@ name: Build and Push Container
 
 on:
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: "Rebuild the newest release now (same as the monthly schedule)"
+        type: boolean
+        default: false
   push:
     branches:
       - master
     tags:
       - "*"
   # apk packages are not pinned, so a published image only picks up Alpine
-  # security fixes when it is rebuilt. Rebuild the newest release once a week
-  # (without cache) and move :X.Y.Z and :stable to the fresh image.
+  # security fixes when it is rebuilt. Rebuild the newest release once a month
+  # (without cache): it is pushed as an immutable :X.Y.Z-YYYYMMDD and moves
+  # :X.Y.Z and :stable to the fresh image.
   schedule:
-    - cron: "17 4 * * 1"
+    - cron: "17 4 1 * *"
 
 # Serialise builds per ref. Not one global group: GitHub keeps only one
 # pending run per group, so a burst of pushes would silently drop queued
 # release tags. The moving tags (:latest, :stable) are only attached by the
 # promote job, which runs in one group per moving tag (see there).
 concurrency:
-  group: publish-${{ github.event_name == 'schedule' && 'schedule' || github.ref }}
+  group: publish-${{ (github.event_name == 'schedule' || inputs.rebuild) && 'rebuild' || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -58,6 +64,8 @@ jobs:
       - name: Decide what to publish
         id: plan
         shell: bash
+        env:
+          INPUT_REBUILD: ${{ inputs.rebuild }}
         run: |
           set -euo pipefail
 
@@ -68,7 +76,7 @@ jobs:
           echo "IMAGE=${IMAGE}"
 
           # mode: latest (master push), sha (manual run), release (tag or
-          # scheduled rebuild). promote names the moving tag the promote job
+          # rebuild). promote names the moving tag the promote job
           # may attach afterwards (latest, stable or empty).
           emit() {
             {
@@ -100,6 +108,30 @@ jobs:
             fi
           }
 
+          # Rebuild the newest plain release on master (sort -V is
+          # unambiguous for X.Y.Z without prerelease suffixes). A newer tag
+          # off master is skipped instead of blocking the rebuild.
+          plan_rebuild() {
+            local TAG="" COMMIT="" CANDIDATE C
+            while IFS= read -r CANDIDATE; do
+              if ! C="$(git rev-parse -q --verify "refs/tags/${CANDIDATE}^{commit}")"; then
+                echo "::notice::skipping tag ${CANDIDATE}: does not point to a commit"
+                continue
+              fi
+              if git merge-base --is-ancestor "$C" origin/master; then
+                TAG="$CANDIDATE"
+                COMMIT="$C"
+                break
+              fi
+              echo "::notice::skipping tag ${CANDIDATE}: ${C} is not reachable from master"
+            done < <(git tag -l | grep -E "$RELEASE_RE" | awk 'length($0) <= 128' | sort -rV)
+
+            if [[ -z "$TAG" ]]; then
+              skip "no release tag on master yet"
+            fi
+            emit release "$COMMIT" "$TAG" true stable
+          }
+
           case "${GITHUB_EVENT_NAME}" in
             push)
               # Staging: every push to master builds :master-<sha>, the
@@ -129,32 +161,15 @@ jobs:
                 echo "::error::manual runs only publish from master, not ${GITHUB_REF}"
                 exit 1
               fi
-              emit sha "${GITHUB_SHA}"
+              if [[ "${INPUT_REBUILD}" == "true" ]]; then
+                plan_rebuild
+              else
+                emit sha "${GITHUB_SHA}"
+              fi
               ;;
 
             schedule)
-              # Rebuild the newest plain release on master (sort -V is
-              # unambiguous for X.Y.Z without prerelease suffixes). A newer
-              # tag off master is skipped instead of blocking the rebuild.
-              TAG=""
-              COMMIT=""
-              while IFS= read -r CANDIDATE; do
-                if ! C="$(git rev-parse -q --verify "refs/tags/${CANDIDATE}^{commit}")"; then
-                  echo "::notice::skipping tag ${CANDIDATE}: does not point to a commit"
-                  continue
-                fi
-                if git merge-base --is-ancestor "$C" origin/master; then
-                  TAG="$CANDIDATE"
-                  COMMIT="$C"
-                  break
-                fi
-                echo "::notice::skipping tag ${CANDIDATE}: ${C} is not reachable from master"
-              done < <(git tag -l | grep -E "$RELEASE_RE" | awk 'length($0) <= 128' | sort -rV)
-
-              if [[ -z "$TAG" ]]; then
-                skip "no release tag on master yet"
-              fi
-              emit release "$COMMIT" "$TAG" true stable
+              plan_rebuild
               ;;
 
             *)
@@ -185,7 +200,7 @@ jobs:
       MODE: ${{ needs.plan.outputs.mode }}
       RELEASE: ${{ needs.plan.outputs.release }}
       COMMIT: ${{ needs.plan.outputs.commit }}
-      # Scheduled rebuilds re-pull the base image and build the smoke images
+      # Rebuilds (scheduled or manual) re-pull the base image and build the smoke images
       # without cache, so apk really fetches current packages. They write a
       # cache scope of their own, which the publish build then reads: it
       # pushes exactly the layers that were tested, not a second fresh build.
@@ -293,6 +308,12 @@ jobs:
                 exit 1
               fi
               tags=("${IMAGE}:${RELEASE}")
+              # A rebuild moves :X.Y.Z to fresh packages. The dated tag keeps
+              # every rebuild addressable for a rollback; a second rebuild on
+              # the same day replaces that day's tag.
+              if [[ "${REBUILD}" == "true" ]]; then
+                tags+=("${IMAGE}:${RELEASE}-$(date -u +%Y%m%d)")
+              fi
               ;;
             *)
               echo "::error::unknown mode ${MODE}"
@@ -307,7 +328,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "resolved tags: ${tags[*]}"
 
-      # Not no-cache, also on the scheduled rebuild: the smoke builds above
+      # Not no-cache, also on a rebuild: the smoke builds above
       # produced every platform's layers, so this pushes the layers that were
       # tested. Exporting them again under a publish scope would only
       # duplicate cache, so there is no cache-to here.
@@ -332,12 +353,12 @@ jobs:
       # actions/attest directly: attest-build-provenance v4 is only a wrapper
       # around it. No storage record, which would need artifact-metadata: write.
       # actions/attest always records GITHUB_SHA as the source and has no
-      # input to override it. On the scheduled rebuild that is the master
-      # head, not the release commit, so it is skipped there; the rebuild
-      # relies on the buildkit provenance (mode=max) above, which records the
-      # revision that was actually built.
+      # input to override it. On a rebuild (scheduled or manual) that is the
+      # master head, not the release commit, so it is skipped there; the
+      # rebuild relies on the buildkit provenance (mode=max) above, which
+      # records the revision that was actually built.
       - name: Attest build provenance
-        if: github.event_name != 'schedule'
+        if: env.REBUILD != 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
@@ -347,7 +368,7 @@ jobs:
 
   # Attaches :latest or :stable to the digest just pushed. One concurrency
   # group per moving tag, shared by every run that may write it (tag runs and
-  # the schedule for :stable), and the check is repeated inside the group, so
+  # the rebuilds for :stable), and the check is repeated inside the group, so
   # an older build cannot move the tag backwards.
   promote:
     needs: [plan, publish]

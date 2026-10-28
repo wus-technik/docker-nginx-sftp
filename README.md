@@ -40,10 +40,20 @@ Images are published to GitHub Container Registry as
     follow
   * `X.Y.Z` - a specific release; prerelease tags (`X.Y.Z-rc1`) are published
     under their own tag only and never move `stable`
+  * `X.Y.Z-YYYYMMDD` - a monthly rebuild of release `X.Y.Z` (see below); this
+    tag never moves, use it to pin or roll back to a specific build
   * `latest` - the current state of `master` (staging, may break)
   * `master-<short sha>` - a specific `master` build
 
 Images are built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`.
+
+The Alpine packages in the image are not pinned, so they only get security
+fixes when the image is rebuilt. On the 1st of every month the newest release
+is rebuilt from the same source without cache. The rebuild is published as
+`X.Y.Z-YYYYMMDD` and moves `X.Y.Z` and `stable` to it, so `X.Y.Z` means "this
+release with current packages". A rebuild never creates a new version number.
+It can also be started by hand: run the "Build and Push Container" workflow on
+`master` with "rebuild" checked.
 
 Configuration
 -------------
