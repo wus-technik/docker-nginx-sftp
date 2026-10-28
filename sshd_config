@@ -10,16 +10,36 @@ HostKey /etc/ssh/keys/ssh_host_ed25519_key
 # See: https://github.com/atmoz/sftp/issues/11
 UseDNS no
 
+# Authentication: the user has a password and nothing else, so the plain
+# password method is the only one needed. keyboard-interactive would be a
+# second way to ask for the same password. Both are set explicitly so a
+# changed upstream default cannot silently change how users log in.
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+PermitUserEnvironment no
+# Logins are further limited to the configured user: entrypoint.sh starts
+# sshd with "-o AllowUsers=<USER>", since the name is only known at runtime.
+
 # Limited access
 PermitRootLogin no
+# DisableForwarding covers X11, agent, TCP and stream-local (unix socket)
+# forwarding in one go and wins over the individual switches. Those stay set
+# as well, because "sshd -T" reports them on their own and would otherwise
+# show "yes" for an audit. Tunnel devices are not part of DisableForwarding.
+DisableForwarding yes
 X11Forwarding no
 AllowTcpForwarding no
 AllowAgentForwarding no
+AllowStreamLocalForwarding no
 PermitTunnel no
 
-# Force sftp and chroot jail
-Subsystem sftp internal-sftp
-ForceCommand internal-sftp
+# Force sftp and chroot jail. -u 022 is the umask for uploads and new
+# directories: whatever mode the client sends, group and others never get
+# write access, and a normal upload ends up 0644/0755, readable by nginx.
+# The entrypoint no longer widens modes, so this is what makes files servable.
+# An explicit chmod (e.g. to 0600 to keep a file private) is not affected.
+Subsystem sftp internal-sftp -u 022
+ForceCommand internal-sftp -u 022
 ChrootDirectory %h
 
 # Enable this for more logs

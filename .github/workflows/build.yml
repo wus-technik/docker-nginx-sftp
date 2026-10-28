@@ -7,127 +7,447 @@ on:
       - master
     tags:
       - "*"
+  # apk packages are not pinned, so a published image only picks up Alpine
+  # security fixes when it is rebuilt. Rebuild the newest release once a week
+  # (without cache) and move :X.Y.Z and :stable to the fresh image.
+  schedule:
+    - cron: "17 4 * * 1"
+
+# Serialise builds per ref. Not one global group: GitHub keeps only one
+# pending run per group, so a burst of pushes would silently drop queued
+# release tags. The moving tags (:latest, :stable) are only attached by the
+# promote job, which runs in one group per moving tag (see there).
+concurrency:
+  group: publish-${{ github.event_name == 'schedule' && 'schedule' || github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Plain releases only. Docker tags allow [A-Za-z0-9_.-], so semver build
+  # metadata ("+build") is rejected rather than producing an unpushable tag.
+  # Docker tags are also limited to 128 characters (checked separately).
+  RELEASE_RE: '^[0-9]+\.[0-9]+\.[0-9]+$'
+  RELEASE_OR_PRE_RE: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
 jobs:
-  build-and-push:
+  # Decides whether and what to publish, without any write permission. Every
+  # image that is published must come from a commit on master.
+  plan:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      mode: ${{ steps.plan.outputs.mode }}
+      release: ${{ steps.plan.outputs.release }}
+      commit: ${{ steps.plan.outputs.commit }}
+      image: ${{ steps.plan.outputs.image }}
+      rebuild: ${{ steps.plan.outputs.rebuild }}
+      promote: ${{ steps.plan.outputs.promote }}
+
+    steps:
+      - name: Checkout repository (full history for tags and ancestry)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # The repository is public, so the git fetches below work
+          # anonymously; no token needs to stay in .git/config.
+          persist-credentials: false
+
+      - name: Decide what to publish
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          echo "GITHUB_EVENT_NAME=${GITHUB_EVENT_NAME}"
+          echo "GITHUB_REF=${GITHUB_REF}"
+          echo "IMAGE=${IMAGE}"
+
+          # mode: latest (master push), sha (manual run), release (tag or
+          # scheduled rebuild). promote names the moving tag the promote job
+          # may attach afterwards (latest, stable or empty).
+          emit() {
+            {
+              echo "skip=false"
+              echo "image=${IMAGE}"
+              echo "mode=$1"
+              echo "commit=$2"
+              echo "release=${3:-}"
+              echo "rebuild=${4:-false}"
+              echo "promote=${5:-}"
+            } >> "$GITHUB_OUTPUT"
+            echo "plan: mode=$1 commit=$2 release=${3:-} rebuild=${4:-false} promote=${5:-}"
+          }
+
+          skip() {
+            echo "$1 -> skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          git fetch --force --tags origin
+          git fetch --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
+
+          # Tags can be pushed for any commit; only publish those on master.
+          require_on_master() {
+            if ! git merge-base --is-ancestor "$2" origin/master; then
+              echo "::error::$1 points to $2, which is not reachable from master; refusing to publish"
+              exit 1
+            fi
+          }
+
+          case "${GITHUB_EVENT_NAME}" in
+            push)
+              # Staging: every push to master builds :master-<sha>, the
+              # promote job then moves :latest
+              if [[ "${GITHUB_REF}" == "refs/heads/master" ]]; then
+                emit latest "${GITHUB_SHA}" "" false latest
+                exit 0
+              fi
+
+              TAG="${GITHUB_REF_NAME}"
+              if [[ ! "$TAG" =~ $RELEASE_OR_PRE_RE ]] || [[ ${#TAG} -gt 128 ]]; then
+                skip "tag ${TAG} is not X.Y.Z[-prerelease] of at most 128 characters"
+              fi
+
+              COMMIT="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+              require_on_master "tag ${TAG}" "$COMMIT"
+              # Prerelease tags (e.g. 1.3.0-rc1) never carry :stable
+              if [[ "$TAG" =~ $RELEASE_RE ]]; then
+                emit release "$COMMIT" "$TAG" false stable
+              else
+                emit release "$COMMIT" "$TAG" false
+              fi
+              ;;
+
+            workflow_dispatch)
+              if [[ "${GITHUB_REF}" != "refs/heads/master" ]]; then
+                echo "::error::manual runs only publish from master, not ${GITHUB_REF}"
+                exit 1
+              fi
+              emit sha "${GITHUB_SHA}"
+              ;;
+
+            schedule)
+              # Rebuild the newest plain release on master (sort -V is
+              # unambiguous for X.Y.Z without prerelease suffixes). A newer
+              # tag off master is skipped instead of blocking the rebuild.
+              TAG=""
+              COMMIT=""
+              while IFS= read -r CANDIDATE; do
+                if ! C="$(git rev-parse -q --verify "refs/tags/${CANDIDATE}^{commit}")"; then
+                  echo "::notice::skipping tag ${CANDIDATE}: does not point to a commit"
+                  continue
+                fi
+                if git merge-base --is-ancestor "$C" origin/master; then
+                  TAG="$CANDIDATE"
+                  COMMIT="$C"
+                  break
+                fi
+                echo "::notice::skipping tag ${CANDIDATE}: ${C} is not reachable from master"
+              done < <(git tag -l | grep -E "$RELEASE_RE" | awk 'length($0) <= 128' | sort -rV)
+
+              if [[ -z "$TAG" ]]; then
+                skip "no release tag on master yet"
+              fi
+              emit release "$COMMIT" "$TAG" true stable
+              ;;
+
+            *)
+              echo "::error::unexpected event ${GITHUB_EVENT_NAME}"
+              exit 1
+              ;;
+          esac
+
+  # Builds, smoke-tests and pushes the image under its immutable tags only
+  # (:X.Y.Z, :master-<sha>, :<sha>). The moving tags follow in promote.
+  publish:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
       packages: write
+      # Signed build provenance: OIDC token for Sigstore, attestations API
+      id-token: write
+      attestations: write
+
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+
+    env:
+      IMAGE: ${{ needs.plan.outputs.image }}
+      MODE: ${{ needs.plan.outputs.mode }}
+      RELEASE: ${{ needs.plan.outputs.release }}
+      COMMIT: ${{ needs.plan.outputs.commit }}
+      # Scheduled rebuilds re-pull the base image and build the smoke images
+      # without cache, so apk really fetches current packages. They write a
+      # cache scope of their own, which the publish build then reads: it
+      # pushes exactly the layers that were tested, not a second fresh build.
+      REBUILD: ${{ needs.plan.outputs.rebuild }}
+      CACHE: ${{ needs.plan.outputs.rebuild == 'true' && 'rebuild' || 'smoke' }}
 
     steps:
-      - name: Checkout repository (full history for tags)
-        uses: actions/checkout@v7
+      - name: Checkout the planned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
-
-      - name: Compute image tags
-        id: meta
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY}"
-          TAG="${GITHUB_REF_NAME}"
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-
-          echo "GITHUB_EVENT_NAME=${GITHUB_EVENT_NAME}"
-          echo "GITHUB_REF=${GITHUB_REF}"
-          echo "GITHUB_REF_NAME=${GITHUB_REF_NAME}"
-          echo "IMAGE=${IMAGE}"
-
-          emit_tags() {
-            {
-              echo "skip=false"
-              echo "tags<<TAGS_EOF"
-              printf '%s\n' "$@"
-              echo "TAGS_EOF"
-            } >> "$GITHUB_OUTPUT"
-            echo "resolved tags: $*"
-          }
-
-          # Staging: every push to master moves :latest
-          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/master" ]]; then
-            emit_tags "${IMAGE}:latest" "${IMAGE}:master-${SHORT_SHA}"
-            exit 0
-          fi
-
-          # Anything that is not a tag (e.g. manual run on a branch): SHA only
-          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
-            emit_tags "${IMAGE}:${GITHUB_SHA}"
-            exit 0
-          fi
-
-          # Releases: accept semver-like tags X.Y.Z with optional -prerelease or +build
-          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "TAG did NOT match semver -> skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          git fetch --tags --force
-
-          # Prerelease tags (e.g. 1.3.0-rc1) never carry :stable, even when they
-          # sort above the newest release; they get their own image tag only.
-          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            emit_tags "${IMAGE}:${TAG}"
-            exit 0
-          fi
-
-          # :stable tracks the newest plain release (sort -V is unambiguous
-          # for X.Y.Z without prerelease suffixes)
-          LATEST_TAG="$(git tag -l \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sort -V \
-            | tail -n 1)"
-
-          echo "LATEST_TAG=${LATEST_TAG}"
-
-          if [[ "$TAG" == "$LATEST_TAG" ]]; then
-            emit_tags "${IMAGE}:${TAG}" "${IMAGE}:stable"
-          else
-            emit_tags "${IMAGE}:${TAG}"
-          fi
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up QEMU
-        if: steps.meta.outputs.skip != 'true'
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        if: steps.meta.outputs.skip != 'true'
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        if: steps.meta.outputs.skip != 'true'
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # One cache scope per platform: gha cache entries of the same scope
+      # overwrite each other. no-cache makes buildkit ignore cache-from, but
+      # cache-to still exports the freshly built layers.
       - name: Build amd64 image for smoke test
-        if: steps.meta.outputs.skip != 'true'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
           platforms: linux/amd64
-          tags: nginx-sftp:smoke
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: nginx-sftp:smoke-amd64
+          pull: ${{ env.REBUILD == 'true' }}
+          no-cache: ${{ env.REBUILD == 'true' }}
+          cache-from: type=gha,scope=${{ env.CACHE }}-amd64
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE }}-amd64
 
-      - name: Smoke test image
-        if: steps.meta.outputs.skip != 'true'
+      - name: Smoke test amd64 image
         timeout-minutes: 15
-        run: ./ci/smoke-test.sh nginx-sftp:smoke
+        run: ./ci/smoke-test.sh nginx-sftp:smoke-amd64
 
+      # arm64 and arm/v7 run under QEMU emulation, hence the longer timeouts.
+      # Each takes a couple of minutes, cheap enough to test every published
+      # platform rather than only the runner's own.
+      - name: Build arm64 image for smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          platforms: linux/arm64
+          tags: nginx-sftp:smoke-arm64
+          pull: ${{ env.REBUILD == 'true' }}
+          no-cache: ${{ env.REBUILD == 'true' }}
+          cache-from: type=gha,scope=${{ env.CACHE }}-arm64
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE }}-arm64
+
+      - name: Smoke test arm64 image (QEMU)
+        timeout-minutes: 30
+        run: ./ci/smoke-test.sh nginx-sftp:smoke-arm64
+
+      - name: Build arm/v7 image for smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          platforms: linux/arm/v7
+          tags: nginx-sftp:smoke-armv7
+          pull: ${{ env.REBUILD == 'true' }}
+          no-cache: ${{ env.REBUILD == 'true' }}
+          cache-from: type=gha,scope=${{ env.CACHE }}-armv7
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE }}-armv7
+
+      - name: Smoke test arm/v7 image (QEMU)
+        timeout-minutes: 30
+        run: ./ci/smoke-test.sh nginx-sftp:smoke-armv7
+
+      - name: Resolve image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${MODE}" in
+            latest)
+              tags=("${IMAGE}:master-${COMMIT:0:7}")
+              ;;
+            sha)
+              tags=("${IMAGE}:${COMMIT}")
+              ;;
+            release)
+              # The tag may have been moved or deleted while this run was
+              # building. Publish only if it still peels to the planned
+              # commit (lightweight tags have no ^{} line).
+              REMOTE="$(git ls-remote origin "refs/tags/${RELEASE}" "refs/tags/${RELEASE}^{}" \
+                | awk -v ref="refs/tags/${RELEASE}" '
+                    $2 == ref "^{}" { peeled = $1 }
+                    $2 == ref       { direct = $1 }
+                    END { print (peeled != "" ? peeled : direct) }')"
+              if [[ "$REMOTE" != "$COMMIT" ]]; then
+                echo "::error::tag ${RELEASE} now points to '${REMOTE:-<deleted>}', not the planned ${COMMIT}; refusing to publish"
+                exit 1
+              fi
+              tags=("${IMAGE}:${RELEASE}")
+              ;;
+            *)
+              echo "::error::unknown mode ${MODE}"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "tags<<TAGS_EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "resolved tags: ${tags[*]}"
+
+      # Not no-cache, also on the scheduled rebuild: the smoke builds above
+      # produced every platform's layers, so this pushes the layers that were
+      # tested. Exporting them again under a publish scope would only
+      # duplicate cache, so there is no cache-to here.
       - name: Build and push image
-        if: steps.meta.outputs.skip != 'true'
-        uses: docker/build-push-action@v7
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm/v7,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
+          tags: ${{ steps.tags.outputs.tags }}
+          # SBOM and full SLSA provenance as registry attestations of the
+          # image; the provenance records the git revision actually built
+          sbom: true
+          provenance: mode=max
+          cache-from: |
+            type=gha,scope=${{ env.CACHE }}-amd64
+            type=gha,scope=${{ env.CACHE }}-arm64
+            type=gha,scope=${{ env.CACHE }}-armv7
+
+      # Signed (Sigstore) provenance, verifiable with "gh attestation verify".
+      # actions/attest directly: attest-build-provenance v4 is only a wrapper
+      # around it. No storage record, which would need artifact-metadata: write.
+      # actions/attest always records GITHUB_SHA as the source and has no
+      # input to override it. On the scheduled rebuild that is the master
+      # head, not the release commit, so it is skipped there; the rebuild
+      # relies on the buildkit provenance (mode=max) above, which records the
+      # revision that was actually built.
+      - name: Attest build provenance
+        if: github.event_name != 'schedule'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+  # Attaches :latest or :stable to the digest just pushed. One concurrency
+  # group per moving tag, shared by every run that may write it (tag runs and
+  # the schedule for :stable), and the check is repeated inside the group, so
+  # an older build cannot move the tag backwards.
+  promote:
+    needs: [plan, publish]
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.promote != ''
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: promote-${{ needs.plan.outputs.promote }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      IMAGE: ${{ needs.plan.outputs.image }}
+      RELEASE: ${{ needs.plan.outputs.release }}
+      COMMIT: ${{ needs.plan.outputs.commit }}
+      PROMOTE: ${{ needs.plan.outputs.promote }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+
+    steps:
+      - name: Checkout repository (full history for tags and ancestry)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attach the moving tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::publish returned no usable digest ('${DIGEST}')"
+            exit 1
+          fi
+
+          case "${PROMOTE}" in
+            latest)
+              HEAD="$(git ls-remote origin refs/heads/master \
+                | awk '$2 == "refs/heads/master" { print $1 }')"
+              if [[ "$HEAD" != "$COMMIT" ]]; then
+                echo "::notice::master has moved on to ${HEAD:-<unknown>}; not moving :latest to ${COMMIT}"
+                exit 0
+              fi
+              ;;
+
+            stable)
+              git fetch --force --tags origin
+              git fetch --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
+
+              # Newest plain release on master; tags off master are skipped
+              NEWEST=""
+              while IFS= read -r CANDIDATE; do
+                if ! C="$(git rev-parse -q --verify "refs/tags/${CANDIDATE}^{commit}")"; then
+                  echo "::notice::skipping tag ${CANDIDATE}: does not point to a commit"
+                  continue
+                fi
+                if git merge-base --is-ancestor "$C" origin/master; then
+                  NEWEST="$CANDIDATE"
+                  break
+                fi
+                echo "::notice::skipping tag ${CANDIDATE}: ${C} is not reachable from master"
+              done < <(git tag -l | grep -E "$RELEASE_RE" | awk 'length($0) <= 128' | sort -rV)
+
+              echo "NEWEST=${NEWEST}"
+              if [[ "$RELEASE" != "$NEWEST" ]]; then
+                echo "::notice::${RELEASE} is not the newest release on master (${NEWEST:-none}); not moving :stable"
+                exit 0
+              fi
+
+              REMOTE="$(git ls-remote origin "refs/tags/${RELEASE}" "refs/tags/${RELEASE}^{}" \
+                | awk -v ref="refs/tags/${RELEASE}" '
+                    $2 == ref "^{}" { peeled = $1 }
+                    $2 == ref       { direct = $1 }
+                    END { print (peeled != "" ? peeled : direct) }')"
+              if [[ "$REMOTE" != "$COMMIT" ]]; then
+                echo "::error::tag ${RELEASE} now points to '${REMOTE:-<deleted>}', not the built ${COMMIT}; refusing to move :stable"
+                exit 1
+              fi
+              ;;
+
+            *)
+              echo "::error::unknown moving tag ${PROMOTE}"
+              exit 1
+              ;;
+          esac
+
+          # A single index source is copied as is, so the moving tag gets the
+          # same digest and with it the SBOM and provenance attestations
+          docker buildx imagetools create --tag "${IMAGE}:${PROMOTE}" "${IMAGE}@${DIGEST}"
+          echo "${IMAGE}:${PROMOTE} -> ${DIGEST}"
