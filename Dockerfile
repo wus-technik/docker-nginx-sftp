@@ -1,6 +1,9 @@
-# Base version is an ARG so CI can pin/override it without editing the file.
-ARG ALPINE_VERSION=3.24
-FROM alpine:${ALPINE_VERSION}
+# Pinned to the multi-arch index digest, not just the tag: the same commit
+# always builds on the same base, and a moved tag cannot slip a different image
+# in. The tag stays in front for humans and so Dependabot (docker ecosystem)
+# can propose digest and version bumps as reviewable PRs. Update both together:
+#   docker buildx imagetools inspect alpine:3.24   (the top-level "Digest")
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 
 LABEL org.opencontainers.image.title="docker-nginx-sftp" \
       org.opencontainers.image.description="wus-technik maintained nginx image serving static files that are managed over SFTP, based on upstream theomega/docker-nginx-sftp" \
