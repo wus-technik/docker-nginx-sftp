@@ -3,7 +3,7 @@
 # in. The tag stays in front for humans and so Dependabot (docker ecosystem)
 # can propose digest and version bumps as reviewable PRs. Update both together:
 #   docker buildx imagetools inspect alpine:3.24   (the top-level "Digest")
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 
 LABEL org.opencontainers.image.title="docker-nginx-sftp" \
       org.opencontainers.image.description="wus-technik maintained nginx image serving static files that are managed over SFTP, based on upstream theomega/docker-nginx-sftp" \
